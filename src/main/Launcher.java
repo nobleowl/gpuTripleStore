@@ -2,7 +2,16 @@ package main;
 
 // To add dlls to eclipse path: http://stackoverflow.com/questions/11123274/add-dll-to-java-library-path-in-eclipse-pydev-jython-project
 import jcuda.Pointer;
+import static jcuda.driver.JCudaDriver.*;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+
 import jcuda.Sizeof;
+import jcuda.driver.CUcontext;
+import jcuda.driver.CUdevice;
 import jcuda.driver.CUdeviceptr;
 import jcuda.driver.CUfunction;
 import jcuda.driver.CUmodule;
@@ -58,7 +67,12 @@ public class Launcher {
 		// Choose a GPU to run on
 		int deviceUsed = 0; // you can change this
 		System.out.println("Running GPU Number: "+deviceUsed);
-		JCuda.cudaSetDevice(deviceUsed);
+		// Initialize the driver and create a context for the first device.
+        cuInit(deviceUsed);
+        CUcontext pctx = new CUcontext();
+        CUdevice dev = new CUdevice();
+        cuDeviceGet(dev, deviceUsed);
+        cuCtxCreate(pctx, deviceUsed, dev);
 		
 		// Get GPU stats
 		cudaDeviceProp prop = new cudaDeviceProp();
@@ -81,11 +95,11 @@ public class Launcher {
 		CUdeviceptr  resultArrayPointer = new CUdeviceptr ();
 		
 		// Allocate arrays on GPU
-		chckErr( JCuda.cudaMalloc(subjectArrayPointer, numRDFStatements*jcuda.Sizeof.INT) );
-		chckErr( JCuda.cudaMalloc(predicateArrayPointer, numRDFStatements*jcuda.Sizeof.INT) );
-		chckErr( JCuda.cudaMalloc(objectArrayPointer, numRDFStatements*jcuda.Sizeof.INT) );
-		chckErr( JCuda.cudaMalloc(contextArrayPointer, numRDFStatements*jcuda.Sizeof.INT) );
-		chckErr( JCuda.cudaMalloc(resultArrayPointer, numRDFStatements*jcuda.Sizeof.INT) );
+		chckErr( cuMemAlloc(subjectArrayPointer, numRDFStatements*jcuda.Sizeof.INT) );
+		chckErr( cuMemAlloc(predicateArrayPointer, numRDFStatements*jcuda.Sizeof.INT) );
+		chckErr( cuMemAlloc(objectArrayPointer, numRDFStatements*jcuda.Sizeof.INT) );
+		chckErr( cuMemAlloc(contextArrayPointer, numRDFStatements*jcuda.Sizeof.INT) );
+		chckErr( cuMemAlloc(resultArrayPointer, numRDFStatements*jcuda.Sizeof.INT) );
 		
 		// Transfer data from CPU -> GPU
 		chckErr( JCuda.cudaMemcpy(subjectArrayPointer, Pointer.to(subjects), numRDFStatements*jcuda.Sizeof.INT, jcuda.runtime.cudaMemcpyKind.cudaMemcpyHostToDevice) );
@@ -94,7 +108,13 @@ public class Launcher {
 		chckErr( JCuda.cudaMemcpy(contextArrayPointer, Pointer.to(contexts), numRDFStatements*jcuda.Sizeof.INT, jcuda.runtime.cudaMemcpyKind.cudaMemcpyHostToDevice) );
 				
 		// Load the compiled Kernel onto GPU
-		// This code below crashed my JVM :(
+		try {
+			prepareCubinFile("kernels\\vectorQuery.cu");
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+		System.out.println("compiled!");
 		CUmodule module = new CUmodule();
 		chckErr( jcuda.driver.JCudaDriver.cuModuleLoad(module, "kernels\\vectorQuery.cubin") );
 		CUfunction queryFunction = new CUfunction();
@@ -130,11 +150,11 @@ public class Launcher {
 				Pointer.to(new int[] { predicateQuery }), 
 				Pointer.to(new int[] { objectQuery }), 
 				Pointer.to(new int[] { contextQuery }), 
-				Pointer.to(subjects),
-				Pointer.to(predicates),
-				Pointer.to(objects), 
-				Pointer.to(contexts), 
-				Pointer.to(results));
+				Pointer.to(subjectArrayPointer),
+				Pointer.to(predicateArrayPointer),
+				Pointer.to(objectArrayPointer), 
+				Pointer.to(contextArrayPointer), 
+				Pointer.to(resultArrayPointer));
 
 		// Call the kernel function
 		int errorCode = jcuda.driver.JCudaDriver.cuLaunchKernel(queryFunction, 
@@ -150,7 +170,7 @@ public class Launcher {
 		
 		// Copy Results back from GPU -> CPU
 		// Note some times error codes are delayed, so errors here may be from kernel
-		//chckErr( JCuda.cudaMemcpy(Pointer.to(results), resultArrayPointer, numRDFStatements*jcuda.Sizeof.INT, jcuda.runtime.cudaMemcpyKind.cudaMemcpyDeviceToHost) );
+		chckErr( JCuda.cudaMemcpy(Pointer.to(results), resultArrayPointer, numRDFStatements*jcuda.Sizeof.INT, jcuda.runtime.cudaMemcpyKind.cudaMemcpyDeviceToHost) );
 			
 		
 		// Operate on results
@@ -175,4 +195,96 @@ public class Launcher {
 			 System.exit(1);
 		}
 	}
+	
+	 /**
+     * The extension of the given file name is replaced with "ptx".
+     * If the file with the resulting name does not exist, it is 
+     * compiled from the given file using NVCC. The name of the 
+     * PTX file is returned. 
+     * 
+     * @param cuFileName The name of the .CU file
+     * @return The name of the PTX file
+     * @throws IOException If an I/O error occurs
+     */
+    private static String prepareCubinFile(String cuFileName) throws IOException
+    {
+        int endIndex = cuFileName.lastIndexOf('.');
+        if (endIndex == -1)
+        {
+            endIndex = cuFileName.length()-1;
+        }
+        String ptxFileName = cuFileName.substring(0, endIndex+1)+"cubin";
+        File ptxFile = new File(ptxFileName);
+        /*
+        if (ptxFile.exists())
+        {
+            return ptxFileName;
+        }
+        */
+        
+        File cuFile = new File(cuFileName);
+        if (!cuFile.exists())
+        {
+            throw new IOException("Input file not found: "+cuFileName);
+        }
+        String modelString = "-m"+System.getProperty("sun.arch.data.model");        
+        String command = 
+            "nvcc " + modelString + " -arch sm_50" + " -cubin "+
+            cuFile.getPath()+" -o "+ptxFileName;
+        
+        System.out.println("Executing\n"+command);
+        Process process = Runtime.getRuntime().exec(command);
+
+        String errorMessage = 
+            new String(toByteArray(process.getErrorStream()));
+        String outputMessage = 
+            new String(toByteArray(process.getInputStream()));
+        int exitValue = 0;
+        try
+        {
+            exitValue = process.waitFor();
+        }
+        catch (InterruptedException e)
+        {
+            Thread.currentThread().interrupt();
+            throw new IOException(
+                "Interrupted while waiting for nvcc output", e);
+        }
+
+        if (exitValue != 0)
+        {
+            System.out.println("nvcc process exitValue "+exitValue);
+            System.out.println("errorMessage:\n"+errorMessage);
+            System.out.println("outputMessage:\n"+outputMessage);
+            throw new IOException(
+                "Could not create .ptx file: "+errorMessage);
+        }
+        
+        System.out.println("Finished creating PTX file");
+        return ptxFileName;
+    }
+    
+    /**
+     * Fully reads the given InputStream and returns it as a byte array
+     *  
+     * @param inputStream The input stream to read
+     * @return The byte array containing the data from the input stream
+     * @throws IOException If an I/O error occurs
+     */
+    private static byte[] toByteArray(InputStream inputStream) 
+        throws IOException
+    {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        byte buffer[] = new byte[8192];
+        while (true)
+        {
+            int read = inputStream.read(buffer);
+            if (read == -1)
+            {
+                break;
+            }
+            baos.write(buffer, 0, read);
+        }
+        return baos.toByteArray();
+    }
 }
